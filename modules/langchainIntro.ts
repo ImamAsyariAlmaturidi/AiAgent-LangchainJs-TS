@@ -13,6 +13,11 @@ import { z } from "zod";
 import { tool } from "@langchain/core/tools";
 import { createToolCallingAgent } from "langchain/agents";
 import { AgentExecutor } from "langchain/agents";
+import { PDFLoader } from "@langchain/community/document_loaders/fs/pdf";
+import {
+  callbackHandlerPrefersStreaming,
+  HandleLLMNewTokenCallbackFields,
+} from "@langchain/core/dist/callbacks/base";
 dotenv.config();
 export class LanchainIntro {
   private model: ChatAnthropic;
@@ -21,6 +26,14 @@ export class LanchainIntro {
     this.model = new ChatAnthropic({
       temperature: 0.5,
       model: "claude-3-haiku-20240307",
+      streaming: true,
+      callbacks: [
+        {
+          handleLLMNewToken(token) {
+            process.stdout.write(token);
+          },
+        },
+      ],
     });
   }
 
@@ -86,7 +99,7 @@ export class LanchainIntro {
         async ({ input }) => {
           const docs = await retriever.invoke(input);
           const resultDocs = docs.map((doc) => doc.pageContent).join("\n\n");
-          console.log("Retriever Tool Output:", resultDocs);
+          // console.log("Retriever Tool Output:", resultDocs);
           return resultDocs;
         },
         {
@@ -115,15 +128,87 @@ export class LanchainIntro {
       const agentExecutor = new AgentExecutor({
         agent,
         tools,
+        verbose: false,
       });
 
       const result = await agentExecutor.invoke({
         input:
           "Siapa saja sih yang memasukan bola ke dalam gawang, tolong sebutkan namanya?",
       });
-      console.log(result);
     } catch (error) {
       console.error("Error in promptAgent:", error);
     }
+  }
+
+  async langchainPDF() {
+    const urls = [process.env.URL_SCRAP_TARGET || "https://imamasyari.com"];
+    const files = ["document_loaders/example_data/Imam.pdf"];
+    const embeddings = new AzureOpenAIEmbeddings();
+    const splitter = new RecursiveCharacterTextSplitter({
+      chunkSize: 500,
+      chunkOverlap: 100,
+    });
+
+    const loaders = [
+      new CheerioWebBaseLoader(urls[0]).load(),
+      new PDFLoader(files[0], { splitPages: false }).load(),
+    ];
+
+    const [docsWeb, docsPDF] = await Promise.all(loaders);
+    const [splitDocsWeb, splitDocsPDF] = await Promise.all([
+      splitter.splitDocuments(docsWeb),
+      splitter.splitDocuments(docsPDF),
+    ]);
+
+    const vectorStores = await Promise.all([
+      MemoryVectorStore.fromDocuments(splitDocsWeb, embeddings),
+      MemoryVectorStore.fromDocuments(splitDocsPDF, embeddings),
+    ]);
+
+    const retrievers = vectorStores.map((store, i) =>
+      tool(
+        async ({ input }) => {
+          const docs = await store.asRetriever().invoke(input);
+          return docs.map((doc) => doc.pageContent).join("\n\n");
+        },
+        {
+          name: i === 0 ? "Imam_Asyari_Website" : "Imam_Asyari_Portfolio_PDF",
+          description: `Search for information about Imam A'syari from ${
+            i === 0 ? "Website Portfolio" : "PDF Document"
+          }.`,
+          schema: z.object({ input: z.string() }),
+        }
+      )
+    );
+
+    console.log("Web Scraped Data:", docsWeb);
+    console.log("Split Web Docs:", splitDocsWeb);
+    console.log(
+      "Registered Tools:",
+      retrievers.map((t) => t.name)
+    );
+
+    // Agent setup
+    const prompt = ChatPromptTemplate.fromMessages([
+      ["system", "You are a helpful assistant"],
+      ["placeholder", "{chat_history}"],
+      ["human", "{input}"],
+      ["placeholder", "{agent_scratchpad}"],
+    ]);
+    const agent = createToolCallingAgent({
+      llm: this.model,
+      tools: retrievers,
+      prompt,
+    });
+    const agentExecutor = new AgentExecutor({
+      agent,
+      tools: retrievers,
+      verbose: false,
+    });
+
+    // Run agent
+    return await agentExecutor.invoke({
+      input: "Siapa Imam A'syari? coba jelaskan lebih detail",
+    });
   }
 }
