@@ -46,14 +46,6 @@ export class LanchainIntro {
     this.model = new ChatAnthropic({
       temperature: 0.5,
       model: "claude-3-haiku-20240307",
-      streaming: true,
-      callbacks: [
-        {
-          handleLLMNewToken(token) {
-            process.stdout.write(token);
-          },
-        },
-      ],
     });
   }
 
@@ -160,8 +152,13 @@ export class LanchainIntro {
     }
   }
 
-  async langchainPDF() {
-    const formatInstructions = `Extract key financial data from multiple PDF reports and return an array of structured JSON objects.
+  async langchainPDF(message: string) {
+    if (!message || typeof message !== "string") {
+      throw new Error("Invalid message: must be a non-empty string");
+    }
+
+    try {
+      const formatInstructions = `Extract key financial data from multiple PDF reports and return an array of structured JSON objects.
 
 ### **Extraction Guidelines:**
 - Each **PDF report should be a separate object** in the JSON array.
@@ -193,103 +190,112 @@ json
       "<Extracted Ekuitas Field>": "RP. <value>",
       "<Extracted Ekuitas Field>": "RP. <value>"
     }
-  },
-  {
-    "explanation": "<Extracted Explanation>",
-    "Aset": {
-      "<Extracted Aset Field>": "RP. <value>",
-      "<Extracted Aset Field>": "RP. <value>"
-    },
-    "Liabilitas": {
-      "<Extracted Liabilitas Field>": "RP. <value>",
-      "<Extracted Liabilitas Field>": "RP. <value>"
-    },
-    "Ekuitas": {
-      "<Extracted Ekuitas Field>": "RP. <value>",
-      "<Extracted Ekuitas Field>": "RP. <value>"
-    }
   }
-]
+]`;
 
-`;
+      const parser = new JsonOutputParser<Report>();
+      const files = ["document_loaders/example_data/9.pdf"];
 
-    const parser = new JsonOutputParser<Report>();
-    const files = [
-      "document_loaders/example_data/1.pdf",
-      "document_loaders/example_data/2.pdf",
-      "document_loaders/example_data/3.pdf",
-    ];
+      const embeddings = new AzureOpenAIEmbeddings();
+      const splitter = new RecursiveCharacterTextSplitter({
+        chunkSize: 1000,
+        chunkOverlap: 400,
+      });
 
-    const embeddings = new AzureOpenAIEmbeddings();
-    const splitter = new RecursiveCharacterTextSplitter({
-      chunkSize: 1000,
-      chunkOverlap: 400,
-    });
+      // ✅ Load semua PDF sekaligus
+      const loaders = files.map((file) =>
+        new PDFLoader(file, { splitPages: false }).load()
+      );
+      const docsPDFArray = await Promise.all(loaders);
+      const allDocs = docsPDFArray.flat();
 
-    const loaders = files.map((file) =>
-      new PDFLoader(file, { splitPages: false }).load()
-    );
+      // ✅ Split dokumen jadi potongan kecil
+      const splitDocsPDF = await splitter.splitDocuments(allDocs);
 
-    // 1. Load semua PDF sekaligus
-    const docsPDFArray = await Promise.all(loaders);
+      // ✅ Simpan embedding ke dalam Vector Store
+      const vectorStore = await MemoryVectorStore.fromDocuments(
+        splitDocsPDF,
+        embeddings
+      );
 
-    // 2. Gabungkan semua dokumen dari array menjadi satu array besar
-    const allDocs = docsPDFArray.flat();
-
-    // 3. Split dokumen menjadi potongan kecil
-    const splitDocsPDF = await splitter.splitDocuments(allDocs);
-
-    const vectorStores = await Promise.all([
-      MemoryVectorStore.fromDocuments(splitDocsPDF, embeddings),
-    ]);
-
-    const retrievers = vectorStores.map((store) =>
-      tool(
+      // ✅ Buat retriever tool
+      const retrieverTool = tool(
         async ({ input }) => {
-          const docs = await store.asRetriever().invoke(input);
+          const docs = await vectorStore.asRetriever().invoke(input);
           return docs.map((doc) => doc.pageContent).join("\n\n");
         },
         {
           name: "all_bca_report_finance",
-          description: `Search for information about All Bank Central Asia Finance Report. If prompt matches, please use this tool!`,
-          schema: z.object({ input: z.string() }),
+          description:
+            "Retrieve the official Bank Central Asia (BCA) financial report. This tool should only be used when the prompt explicitly requests BCA's financial data.",
+          schema: z.object({
+            input: z
+              .string()
+              .describe(
+                "Specific query about BCA's financial report, e.g., 'BCA Januari 2025 report'"
+              ),
+          }),
         }
-      )
-    );
+      );
 
-    // ✅ **Prompt sudah mencakup `format_instructions`**
-    const prompt = ChatPromptTemplate.fromMessages([
-      ["system", "You are a helpful assistant. {format_instructions}"],
-      ["placeholder", "{chat_history}"],
-      ["human", "{input}"],
-      ["placeholder", "{agent_scratchpad}"],
-    ]);
+      // ✅ Siapkan prompt dengan format_instructions
+      const prompt = ChatPromptTemplate.fromMessages([
+        ["system", "You are a helpful assistant. {format_instructions}"],
+        ["placeholder", "{chat_history}"],
+        ["human", "{input}"],
+        ["placeholder", "{agent_scratchpad}"],
+      ]);
 
-    // ✅ **Partial prompt untuk inject `chat_history` & `agent_scratchpad`**
-    const partialedPrompt = await prompt.partial({
-      chat_history: "",
-    });
+      // ✅ Inject format instructions ke dalam prompt
+      const formattedPrompt = await prompt.partial({
+        chat_history: "",
+        format_instructions: formatInstructions,
+      });
 
-    const chain = partialedPrompt.pipe(this.model).pipe(parser);
+      // ✅ Pastikan `this.model` sudah diinisialisasi
+      if (!this.model) {
+        throw new Error("Model is not initialized");
+      }
 
-    const agent = createToolCallingAgent({
-      llm: this.model,
-      tools: retrievers,
-      prompt: partialedPrompt, // Gunakan prompt yang sudah diperbaiki
-    });
+      // ✅ Siapkan agent
+      const agent = createToolCallingAgent({
+        llm: this.model,
+        tools: [retrieverTool],
+        prompt: formattedPrompt,
+      });
 
-    const agentExecutor = new AgentExecutor({
-      agent,
-      tools: retrievers,
-      verbose: false, // Debugging
-    });
+      // ✅ Jalankan AgentExecutor
+      const agentExecutor = new AgentExecutor({
+        agent,
+        tools: [retrieverTool],
+        verbose: false,
+      });
+      const result = await agentExecutor.invoke({
+        input: message,
+        chat_history: "",
+      });
+      const text = result?.output?.[0]?.text;
+      let extractedJson = null;
 
-    // ✅ **Tambahkan `chat_history` dan `agent_scratchpad` dalam invoke**
-    return await agentExecutor.invoke({
-      input:
-        "Bisa anda  rincikan bulan oktober, november, dan februari untuk laporan keuangan ini? dalam bentuk JSON. dan tolong periksa agar datanya sesuai dengan PDF, ini sangat berbahaya jika anda memberikan nya dengan tidak sesuai",
-      format_instructions: formatInstructions, // Sekarang digunakan di dalam prompt
-      chat_history: "",
-    });
+      if (text) {
+        try {
+          // Coba langsung parse JSON dari teks
+          extractedJson = JSON.parse(
+            text.slice(text.indexOf("["), text.lastIndexOf("]") + 1)
+          );
+        } catch (error) {
+          console.error("Error parsing JSON:", error);
+        }
+      }
+
+      console.log(extractedJson, "Extracted JSON");
+
+      if (extractedJson) {
+        return extractedJson;
+      }
+    } catch (error) {
+      console.error("LangchainPDF Error:", error);
+      throw new Error("Failed to process the PDF data.");
+    }
   }
 }
