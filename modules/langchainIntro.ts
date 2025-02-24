@@ -1,6 +1,9 @@
 import dotenv from "dotenv";
 import { PromptTemplate, ChatPromptTemplate } from "@langchain/core/prompts";
-import { StringOutputParser } from "@langchain/core/output_parsers";
+import {
+  JsonOutputParser,
+  StringOutputParser,
+} from "@langchain/core/output_parsers";
 import { RunnableLambda } from "@langchain/core/runnables";
 import { ChatAnthropic } from "@langchain/anthropic";
 import { Tool } from "@langchain/core/tools";
@@ -14,11 +17,28 @@ import { tool } from "@langchain/core/tools";
 import { createToolCallingAgent } from "langchain/agents";
 import { AgentExecutor } from "langchain/agents";
 import { PDFLoader } from "@langchain/community/document_loaders/fs/pdf";
+import { StructuredOutputParser } from "@langchain/core/output_parsers";
 import {
   callbackHandlerPrefersStreaming,
   HandleLLMNewTokenCallbackFields,
 } from "@langchain/core/dist/callbacks/base";
 dotenv.config();
+
+interface Aset {
+  kas: string;
+  penempatan_pada_bank_indonesia: string;
+  penempatan_pada_bank_lain: string;
+}
+interface Liabilitas {
+  Giro: string;
+  Tabungan: string;
+  Deposito: string;
+}
+interface Report {
+  explanation: string;
+  liablitas: Liabilitas;
+  aset: Aset;
+}
 export class LanchainIntro {
   private model: ChatAnthropic;
 
@@ -141,74 +161,135 @@ export class LanchainIntro {
   }
 
   async langchainPDF() {
-    const urls = [process.env.URL_SCRAP_TARGET || "https://imamasyari.com"];
-    const files = ["document_loaders/example_data/Imam.pdf"];
-    const embeddings = new AzureOpenAIEmbeddings();
-    const splitter = new RecursiveCharacterTextSplitter({
-      chunkSize: 500,
-      chunkOverlap: 100,
-    });
+    const formatInstructions = `Extract key financial data from multiple PDF reports and return an array of structured JSON objects.
 
-    const loaders = [
-      new CheerioWebBaseLoader(urls[0]).load(),
-      new PDFLoader(files[0], { splitPages: false }).load(),
+### **Extraction Guidelines:**
+- Each **PDF report should be a separate object** in the JSON array.
+- Dynamically extract **key financial categories**, including:  
+  - **Aset (Assets)**
+  - **Liabilitas (Liabilities)**
+  - **Ekuitas (Equity)**
+- Use **extracted section headers as JSON keys**.
+- **Prefix all numerical values with "RP."**  
+- Provide a **brief summary** of the report in the "explanation" field.  
+- **If a category is missing, omit it instead of returning null.**  
+
+---
+
+### **Expected Output Format:**
+json
+[
+  {
+    "explanation": "<Extracted Explanation>",
+    "Aset": {
+      "<Extracted Aset Field>": "RP. <value>",
+      "<Extracted Aset Field>": "RP. <value>"
+    },
+    "Liabilitas": {
+      "<Extracted Liabilitas Field>": "RP. <value>",
+      "<Extracted Liabilitas Field>": "RP. <value>"
+    },
+    "Ekuitas": {
+      "<Extracted Ekuitas Field>": "RP. <value>",
+      "<Extracted Ekuitas Field>": "RP. <value>"
+    }
+  },
+  {
+    "explanation": "<Extracted Explanation>",
+    "Aset": {
+      "<Extracted Aset Field>": "RP. <value>",
+      "<Extracted Aset Field>": "RP. <value>"
+    },
+    "Liabilitas": {
+      "<Extracted Liabilitas Field>": "RP. <value>",
+      "<Extracted Liabilitas Field>": "RP. <value>"
+    },
+    "Ekuitas": {
+      "<Extracted Ekuitas Field>": "RP. <value>",
+      "<Extracted Ekuitas Field>": "RP. <value>"
+    }
+  }
+]
+
+`;
+
+    const parser = new JsonOutputParser<Report>();
+    const files = [
+      "document_loaders/example_data/1.pdf",
+      "document_loaders/example_data/2.pdf",
+      "document_loaders/example_data/3.pdf",
     ];
 
-    const [docsWeb, docsPDF] = await Promise.all(loaders);
-    const [splitDocsWeb, splitDocsPDF] = await Promise.all([
-      splitter.splitDocuments(docsWeb),
-      splitter.splitDocuments(docsPDF),
-    ]);
+    const embeddings = new AzureOpenAIEmbeddings();
+    const splitter = new RecursiveCharacterTextSplitter({
+      chunkSize: 1000,
+      chunkOverlap: 400,
+    });
+
+    const loaders = files.map((file) =>
+      new PDFLoader(file, { splitPages: false }).load()
+    );
+
+    // 1. Load semua PDF sekaligus
+    const docsPDFArray = await Promise.all(loaders);
+
+    // 2. Gabungkan semua dokumen dari array menjadi satu array besar
+    const allDocs = docsPDFArray.flat();
+
+    // 3. Split dokumen menjadi potongan kecil
+    const splitDocsPDF = await splitter.splitDocuments(allDocs);
 
     const vectorStores = await Promise.all([
-      MemoryVectorStore.fromDocuments(splitDocsWeb, embeddings),
       MemoryVectorStore.fromDocuments(splitDocsPDF, embeddings),
     ]);
 
-    const retrievers = vectorStores.map((store, i) =>
+    const retrievers = vectorStores.map((store) =>
       tool(
         async ({ input }) => {
           const docs = await store.asRetriever().invoke(input);
           return docs.map((doc) => doc.pageContent).join("\n\n");
         },
         {
-          name: i === 0 ? "Imam_Asyari_Website" : "Imam_Asyari_Portfolio_PDF",
-          description: `Search for information about Imam A'syari from ${
-            i === 0 ? "Website Portfolio" : "PDF Document"
-          }.`,
+          name: "all_bca_report_finance",
+          description: `Search for information about All Bank Central Asia Finance Report. If prompt matches, please use this tool!`,
           schema: z.object({ input: z.string() }),
         }
       )
     );
 
-    console.log("Web Scraped Data:", docsWeb);
-    console.log("Split Web Docs:", splitDocsWeb);
-    console.log(
-      "Registered Tools:",
-      retrievers.map((t) => t.name)
-    );
-
-    // Agent setup
+    // ✅ **Prompt sudah mencakup `format_instructions`**
     const prompt = ChatPromptTemplate.fromMessages([
-      ["system", "You are a helpful assistant"],
+      ["system", "You are a helpful assistant. {format_instructions}"],
       ["placeholder", "{chat_history}"],
       ["human", "{input}"],
       ["placeholder", "{agent_scratchpad}"],
     ]);
+
+    // ✅ **Partial prompt untuk inject `chat_history` & `agent_scratchpad`**
+    const partialedPrompt = await prompt.partial({
+      chat_history: "",
+    });
+
+    const chain = partialedPrompt.pipe(this.model).pipe(parser);
+
     const agent = createToolCallingAgent({
       llm: this.model,
       tools: retrievers,
-      prompt,
+      prompt: partialedPrompt, // Gunakan prompt yang sudah diperbaiki
     });
+
     const agentExecutor = new AgentExecutor({
       agent,
       tools: retrievers,
-      verbose: false,
+      verbose: false, // Debugging
     });
 
-    // Run agent
+    // ✅ **Tambahkan `chat_history` dan `agent_scratchpad` dalam invoke**
     return await agentExecutor.invoke({
-      input: "Siapa Imam A'syari? coba jelaskan lebih detail",
+      input:
+        "Bisa anda  rincikan bulan oktober, november, dan februari untuk laporan keuangan ini? dalam bentuk JSON. dan tolong periksa agar datanya sesuai dengan PDF, ini sangat berbahaya jika anda memberikan nya dengan tidak sesuai",
+      format_instructions: formatInstructions, // Sekarang digunakan di dalam prompt
+      chat_history: "",
     });
   }
 }
